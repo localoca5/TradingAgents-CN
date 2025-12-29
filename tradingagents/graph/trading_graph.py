@@ -868,6 +868,209 @@ class TradingAgentsGraph:
                 ]
             ),
         }
+        
+    def propagate_v1(self, company_name, trade_date, progress_callback=None, task_id=None):
+        """Run the trading agents graph for a company on a specific date.
+
+        Args:
+            company_name: Company name or stock symbol
+            trade_date: Date for analysis
+            progress_callback: Optional callback function for progress updates
+            task_id: Optional task ID for tracking performance data
+
+        Yields:
+            dict: 包含中间状态、当前节点信息和进度数据
+        """
+        
+        # 添加详细的接收日志
+        logger.debug(f"🔍 [GRAPH DEBUG] ===== TradingAgentsGraph.propagate 接收参数 =====")
+        logger.debug(f"🔍 [GRAPH DEBUG] 接收到的company_name: '{company_name}' (类型: {type(company_name)})")
+        logger.debug(f"🔍 [GRAPH DEBUG] 接收到的trade_date: '{trade_date}' (类型: {type(trade_date)})")
+        logger.debug(f"🔍 [GRAPH DEBUG] 接收到的task_id: '{task_id}'")
+
+        self.ticker = company_name
+        logger.debug(f"🔍 [GRAPH DEBUG] 设置self.ticker: '{self.ticker}'")
+
+        # Initialize state
+        logger.debug(f"🔍 [GRAPH DEBUG] 创建初始状态，传递参数: company_name='{company_name}', trade_date='{trade_date}'")
+        init_agent_state = self.propagator.create_initial_state(
+            company_name, trade_date
+        )
+        logger.debug(f"🔍 [GRAPH DEBUG] 初始状态中的company_of_interest: '{init_agent_state.get('company_of_interest', 'NOT_FOUND')}'")
+        logger.debug(f"🔍 [GRAPH DEBUG] 初始状态中的trade_date: '{init_agent_state.get('trade_date', 'NOT_FOUND')}'")
+
+        # 初始化计时器
+        node_timings = {}  # 记录每个节点的执行时间
+        total_start_time = time.time()  # 总体开始时间
+        current_node_start = None  # 当前节点开始时间
+        current_node_name = None  # 当前节点名称
+        executed_nodes = []  # 记录已执行的节点
+
+        # 保存task_id用于后续保存性能数据
+        self._current_task_id = task_id
+
+        # 根据是否有进度回调选择不同的stream_mode
+        args = self.propagator.get_graph_args(use_progress_callback=bool(progress_callback))
+
+        # 初始化最终状态
+        final_state = init_agent_state.copy() if not self.debug else None
+        if self.debug:
+            trace = []
+
+        # 记录已完成的节点
+        completed_nodes = set()
+        
+        # 计算总节点数（用于进度百分比）
+        total_nodes = len(self.graph.nodes) if hasattr(self.graph, 'nodes') else 1
+
+        for chunk in self.graph.stream(init_agent_state, **args):
+            # 记录节点计时
+            for node_name in chunk.keys():
+                if not node_name.startswith('__'):
+                    # 如果有上一个节点，记录其结束时间
+                    if current_node_name and current_node_start:
+                        elapsed = time.time() - current_node_start
+                        node_timings[current_node_name] = elapsed
+                        executed_nodes.append(current_node_name)
+                        logger.info(f"⏱️ [{current_node_name}] 耗时: {elapsed:.2f}秒")
+
+                    # 开始新节点计时
+                    current_node_name = node_name
+                    current_node_start = time.time()
+                    break
+
+            # 构建中间结果
+            intermediate_result = {
+                'node_name': current_node_name,
+                'chunk': chunk,
+                'progress': {
+                    'current': len(executed_nodes) + 1,
+                    'total': total_nodes,
+                    'percentage': (len(executed_nodes) + 1) / total_nodes * 100
+                },
+                'executed_nodes': executed_nodes.copy(),
+                'node_timings': node_timings.copy(),
+                'is_complete': False
+            }
+
+            # 发送进度回调
+            if progress_callback and args.get("stream_mode") == "updates":
+                self._send_progress_update(chunk, progress_callback)
+                
+            # 在 updates 模式下，chunk 格式为 {node_name: state_update}
+            # 在 values 模式下，chunk 格式为完整的状态
+            if self.debug:
+                if progress_callback and args.get("stream_mode") == "updates":
+                    # updates 模式：累积状态更新
+                    if final_state is None:
+                        final_state = init_agent_state.copy()
+                    for node_name, node_update in chunk.items():
+                        if not node_name.startswith('__'):
+                            final_state.update(node_update)
+                else:
+                    # values 模式
+                    if len(chunk.get("messages", [])) > 0:
+                        chunk["messages"][-1].pretty_print()
+                    trace.append(chunk)
+                    final_state = chunk
+                    
+                    # 将最终状态添加到中间结果
+                    intermediate_result['current_state'] = final_state.copy()
+            else:
+                # 标准模式
+                if progress_callback:
+                    # 累积状态更新
+                    if final_state is None:
+                        final_state = init_agent_state.copy()
+                    for node_name, node_update in chunk.items():
+                        if not node_name.startswith('__'):
+                            final_state.update(node_update)
+                else:
+                    # 原有的invoke模式
+                    if final_state is None:
+                        final_state = init_agent_state.copy()
+                    for node_name, node_update in chunk.items():
+                        if not node_name.startswith('__'):
+                            final_state.update(node_update)
+                
+                # 将最终状态添加到中间结果
+                intermediate_result['current_state'] = final_state.copy()
+
+            # 添加当前节点输出
+            for key, value in chunk.items():
+                if not key.startswith('__'):
+                    intermediate_result[f'node_output_{key}'] = value
+
+            # 记录已完成的节点
+            if current_node_name and current_node_name not in completed_nodes:
+                completed_nodes.add(current_node_name)
+                intermediate_result['completed_nodes'] = list(completed_nodes)
+
+            # 产出中间结果
+            yield intermediate_result
+
+        # 记录最后一个节点的时间
+        if current_node_name and current_node_start:
+            elapsed = time.time() - current_node_start
+            node_timings[current_node_name] = elapsed
+            executed_nodes.append(current_node_name)
+            logger.info(f"⏱️ [{current_node_name}] 耗时: {elapsed:.2f}秒")
+
+        # 计算总时间
+        total_elapsed = time.time() - total_start_time
+
+        # 调试日志
+        logger.info(f"🔍 [TIMING DEBUG] 节点计时数量: {len(node_timings)}")
+        logger.info(f"🔍 [TIMING DEBUG] 总耗时: {total_elapsed:.2f}秒")
+        logger.info(f"🔍 [TIMING DEBUG] 节点列表: {list(node_timings.keys())}")
+
+        # 打印详细的时间统计
+        logger.info("🔍 [TIMING DEBUG] 准备调用 _print_timing_summary")
+        self._print_timing_summary(node_timings, total_elapsed)
+        logger.info("🔍 [TIMING DEBUG] _print_timing_summary 调用完成")
+
+        # 构建性能数据
+        performance_data = self._build_performance_data(node_timings, total_elapsed)
+
+        # 确保final_state存在
+        if final_state is None:
+            final_state = init_agent_state.copy()
+
+        # 将性能数据添加到状态中
+        final_state['performance_metrics'] = performance_data
+
+        # Store current state for reflection
+        self.curr_state = final_state
+
+        # Log state
+        self._log_state(trade_date, final_state)
+
+        # 获取模型信息
+        model_info = ""
+        try:
+            if hasattr(self.deep_thinking_llm, 'model_name'):
+                model_info = f"{self.deep_thinking_llm.__class__.__name__}:{self.deep_thinking_llm.model_name}"
+            else:
+                model_info = self.deep_thinking_llm.__class__.__name__
+        except Exception:
+            model_info = "Unknown"
+
+        # 处理决策并添加模型信息
+        decision = self.process_signal(final_state["final_trade_decision"], company_name)
+        decision['model_info'] = model_info
+
+        # 产出最终结果
+        final_result = {
+            'is_complete': True,
+            'final_state': final_state,
+            'decision': decision,
+            'performance_metrics': performance_data,
+            'node_timings': node_timings,
+            'total_elapsed': total_elapsed,
+            'executed_nodes': executed_nodes
+        }
+        
+        yield final_result
 
     def propagate(self, company_name, trade_date, progress_callback=None, task_id=None):
         """Run the trading agents graph for a company on a specific date.
